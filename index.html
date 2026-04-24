@@ -407,13 +407,14 @@
       <span class="icon">🔗</span>
       <div style="flex:1">
         <h3>Conecta tu Google Sheet</h3>
-        <p>Pega el ID de tu hoja de Google Sheets. Asegúrate de que la hoja sea pública o compartida con el acceso correcto.</p>
+        <p>Pega el ID de tu hoja y la URL de tu Apps Script para lectura y escritura en tiempo real.</p>
         <div class="setup-form">
-          <input type="text" id="sheetIdInput" placeholder="Ejemplo: 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms" />
-          <button class="btn btn-primary" onclick="connectSheet()">Conectar Hoja</button>
+          <input type="text" id="sheetIdInput" placeholder="ID del Google Sheet: 1BxiMVs0XRA5nFMdK..." style="flex:2" />
+          <input type="text" id="scriptUrlInput" placeholder="URL del Apps Script: https://script.google.com/macros/s/..." style="flex:3" />
+          <button class="btn btn-primary" onclick="connectSheet()">Conectar</button>
         </div>
         <p style="margin-top:8px;font-size:12px;color:var(--muted)">
-          💡 El ID está en la URL: docs.google.com/spreadsheets/d/<strong>[ID]</strong>/edit
+          💡 ID en la URL: docs.google.com/spreadsheets/d/<strong>[ID]</strong>/edit &nbsp;|&nbsp; La URL del Script se obtiene al publicar el Apps Script como webapp.
         </p>
       </div>
     </div>
@@ -573,7 +574,7 @@
 // STATE
 // ═══════════════════════════════════════════
 let SHEET_ID = localStorage.getItem('sena_sheet_id') || '';
-let API_KEY = ''; // Public sheets don't need key with ?alt=json trick
+let SCRIPT_URL = localStorage.getItem('sena_script_url') || '';
 let currentSheet = 'home';
 let editingRow = null;
 let editingSheet = null;
@@ -619,35 +620,33 @@ function navigate(page) {
 // ═══════════════════════════════════════════
 function connectSheet() {
   const input = document.getElementById('sheetIdInput').value.trim();
+  const scriptInput = document.getElementById('scriptUrlInput').value.trim();
   if (!input) { toast('Ingresa el ID de tu Google Sheet', 'error'); return; }
   SHEET_ID = input;
   localStorage.setItem('sena_sheet_id', SHEET_ID);
+  if (scriptInput) {
+    SCRIPT_URL = scriptInput;
+    localStorage.setItem('sena_script_url', SCRIPT_URL);
+  }
   syncAll();
 }
 
 async function fetchSheet(sheetName) {
-  // Uses CSV export URL — compatible with public sheets and avoids CORS issues
   const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(sheetName)}`;
   const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error(`HTTP ${res.status} al leer: ${sheetName}`);
   const text = await res.text();
-  if (!text || text.trim() === '') throw new Error('La hoja está vacía o no existe: ' + sheetName);
+  if (!text || text.trim() === '') return [];
 
-  // Parse CSV (handles quoted fields with commas inside)
   function parseCSV(csv) {
-    const lines = [];
-    let cur = '', inQ = false, row = [];
+    const lines = []; let cur = '', inQ = false, row = [];
     for (let i = 0; i < csv.length; i++) {
       const ch = csv[i];
-      if (ch === '"') {
-        if (inQ && csv[i+1] === '"') { cur += '"'; i++; }
-        else inQ = !inQ;
-      } else if (ch === ',' && !inQ) {
-        row.push(cur); cur = '';
-      } else if ((ch === '\n' || ch === '\r') && !inQ) {
+      if (ch === '"') { if (inQ && csv[i+1] === '"') { cur += '"'; i++; } else inQ = !inQ; }
+      else if (ch === ',' && !inQ) { row.push(cur); cur = ''; }
+      else if ((ch === '\n' || ch === '\r') && !inQ) {
         if (ch === '\r' && csv[i+1] === '\n') i++;
-        row.push(cur); cur = '';
-        lines.push(row); row = [];
+        row.push(cur); cur = ''; lines.push(row); row = [];
       } else { cur += ch; }
     }
     if (cur || row.length) { row.push(cur); lines.push(row); }
@@ -662,6 +661,30 @@ async function fetchSheet(sheetName) {
     headers.forEach((h, i) => { row[h] = (cells[i] || '').trim(); });
     return row;
   });
+}
+
+// ─── WRITE via Apps Script ────────────────
+async function writeToSheet(action, sheet, rowData, rowIndex) {
+  if (!SCRIPT_URL) {
+    toast('⚠️ Agrega la URL del Apps Script para guardar en Google Sheets', 'error');
+    return false;
+  }
+  const sheetName = SHEET_NAMES[sheet];
+  const headers = COLS[sheet];
+  const values = headers.map(h => rowData[h] || '');
+  const payload = { action, sheet: sheetName, values, rowIndex };
+  try {
+    const res = await fetch(SCRIPT_URL, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+    const json = await res.json();
+    if (json.status !== 'ok') throw new Error(json.message || 'Error desconocido');
+    return true;
+  } catch (e) {
+    toast('Error al guardar: ' + e.message, 'error');
+    return false;
+  }
 }
 
 async function syncAll() {
@@ -951,7 +974,7 @@ function autoFillPrograma() {
   }
 }
 
-function saveRow() {
+async function saveRow() {
   const s = editingSheet;
   let newRow = {};
 
@@ -983,37 +1006,45 @@ function saveRow() {
     };
   }
 
-  if (editingRow !== null) {
-    // Update
+  const isEdit = editingRow !== null;
+
+  // Find actual row index in Google Sheets (1-based, +1 for header)
+  let sheetRowIndex = null;
+  if (isEdit) {
     const actualIndex = data[s].indexOf(filteredData[s][editingRow]);
+    sheetRowIndex = actualIndex + 2; // +1 header, +1 for 1-based
     if (actualIndex >= 0) data[s][actualIndex] = newRow;
     else filteredData[s][editingRow] = newRow;
   } else {
     data[s].push(newRow);
+    sheetRowIndex = data[s].length + 1;
   }
 
   filteredData[s] = [...data[s]];
   renderAll();
   updateBadges();
   closeModal();
-  toast(editingRow !== null ? 'Registro actualizado' : 'Registro guardado', 'success');
 
-  // Notify about Google Sheets write
-  if (SHEET_ID) {
-    toast('⚠️ Para guardar en Google Sheets necesitas la Google Apps Script API. Ver instrucciones.', 'error');
+  // Write to Google Sheets via Apps Script
+  const action = isEdit ? 'update' : 'append';
+  const ok = await writeToSheet(action, s, newRow, sheetRowIndex);
+  if (ok) {
+    toast(isEdit ? '✅ Registro actualizado en Google Sheets' : '✅ Registro guardado en Google Sheets', 'success');
   }
 }
 
 function editRow(sheet, index) { openModal(sheet, index); }
 
-function deleteRow(sheet, index) {
+async function deleteRow(sheet, index) {
   if (!confirm('¿Eliminar este registro?')) return;
   const actualIndex = data[sheet].indexOf(filteredData[sheet][index]);
+  const sheetRowIndex = actualIndex + 2;
   if (actualIndex >= 0) data[sheet].splice(actualIndex, 1);
   filteredData[sheet] = [...data[sheet]];
   renderAll();
   updateBadges();
-  toast('Registro eliminado', 'success');
+  const ok = await writeToSheet('delete', sheet, {}, sheetRowIndex);
+  toast(ok ? '✅ Registro eliminado de Google Sheets' : 'Eliminado localmente (sin conexión al Script)', ok ? 'success' : 'error');
 }
 
 function closeModal() { document.getElementById('overlay').classList.remove('open'); editingRow = null; }
@@ -1036,6 +1067,7 @@ function toast(msg, type = 'success') {
 // ═══════════════════════════════════════════
 if (SHEET_ID) {
   document.getElementById('sheetIdInput').value = SHEET_ID;
+  if (SCRIPT_URL) document.getElementById('scriptUrlInput').value = SCRIPT_URL;
   syncAll();
 }
 
